@@ -31,9 +31,8 @@ all = ["torch>=1.12", "xarray>=2022.3", "netCDF4", "scipy"]
 dev = ["pytest>=7.0", "torch>=1.12", "xarray>=2022.3", "scipy"]
 
 [project.urls]
-Homepage = "https://github.com/your-org/metvane"
-Documentation = "https://metvane.readthedocs.io"
-Repository = "https://github.com/your-org/metvane"
+Homepage = "https://github.com/MetAILab/metvane"
+Repository = "https://github.com/MetAILab/metvane"
 
 [tool.setuptools.packages.find]
 where = ["src"]
