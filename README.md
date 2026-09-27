@@ -15,7 +15,7 @@
 - **GPU 加速**：PyTorch 张量自动在 GPU 上计算，无需额外配置
 - **命名空间适配器**：一套代码同时支持 NumPy 和 PyTorch，避免代码重复
 - **四类指标**：回归（连续）、分类、空间、概率
-- **灵活聚合**：整体评估、按预报时刻评估、区域评估
+- **灵活聚合**：整体评估、按预报时刻评估、区域评估、逐格点（全网格）评估
 - **累加器模式**：`update/compute` 模式支持超大数据集分块计算
 - **xarray 便捷层**：通过命名维度 (`preserve_dims` / `reduce_dims`) 轻松聚合
 - **气象工具**：纬度权重、区域掩码、广播权重
@@ -93,6 +93,35 @@ table = ContingencyTable(fcst, obs, thresholds=[20, 35, 40], axis=(1, 2))
 print(table.csi())     # shape: (3, n_leadtimes)
 print(table.pod())
 print(table.summary())  # 所有指标的字典
+```
+
+### 全网格（逐格点）评估与 `weight_mode`
+
+保留空间维（只沿时间/样本平均）即得逐格点统计；`axis=()`、累加器 `preserve_axes` 覆盖全部轴、
+`preserve_dims="all"` 在 NumPy / PyTorch(GPU) / xarray 下行为一致（不做归约）。
+
+```python
+# fcst, obs: (time, lat, lon)
+w  = metvane.latitude_weights(lat)                      # cos(lat)/mean，内部 float64 计算
+wb = metvane.broadcast_weights(w, fcst.shape, lat_axis=-2)
+
+rmse_map = metvane.rmse(fcst, obs, axis=0)              # 逐格点真实 RMSE（画误差分布图用这个）
+contrib  = metvane.rmse(fcst, obs, axis=0, weights=wb, weight_mode="multiply")
+# contrib**2 的格点简单平均 == 纬度加权 MSE（WeatherBench / eval_xrv4 的 multiply_mean1 口径）
+```
+
+| `weight_mode` | 归约公式 | 被保留的纬度维上 | 纬度被全部归约（全球网格、权重均值为 1） |
+|---|---|---|---|
+| `"mean"`（默认） | Σ(w·x) / Σw | 权重约掉 → 不加权 | 纬度加权平均 |
+| `"multiply"` | Σ(w·x) / N（N 为有效点数） | 保留权重 → 面积贡献场 | 与 `"mean"` 相同 |
+
+权重用 `w / w.sum()` 时 `"multiply"` 即 `multiply_sum1` 口径。分母不为正的切片（`"mean"` 下权重和为 0，
+如区域掩码之外；`"multiply"` 下没有有效点；或全为 NaN）没有定义，返回 **NaN** 而不是 0（函数式 API 与累加器一致）。
+累加器与 xarray 层同样支持：
+
+```python
+acc = metvane.ContinuousAccumulator(["rmse"], preserve_axes=[0, 1], weights=w2d, weight_mode="multiply")
+mxr.rmse(fcst_da, obs_da, reduce_dims="time", weights=w_da, weight_mode="multiply")
 ```
 
 ### 累加器模式（大数据集）

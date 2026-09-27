@@ -11,6 +11,7 @@ from typing import Any, Optional, Sequence
 from ..core.array_ns import get_namespace
 from ..core.backend import Backend, convert, detect_backend, ensure_same_backend
 from ..core.typing import normalize_axis
+from ..continuous._impl import check_weight_mode
 
 
 class ContinuousAccumulator:
@@ -27,6 +28,12 @@ class ContinuousAccumulator:
         to the data shape.
     climatology : array-like, optional
         Climatology array — required when ``'acc'`` is in *metrics*.
+    weight_mode : {'mean', 'multiply'}
+        How *weights* enter rmse/mse/mae/bias (see :func:`metvane.rmse`):
+        ``'mean'`` (default) normalizes by the summed weights over reduced axes;
+        ``'multiply'`` divides by the number of points, keeping weights on
+        preserved axes.  Preserving every axis (``preserve_axes`` = all) gives
+        per-grid-point statistics accumulated over chunks.
     backend : {'numpy', 'torch'}, optional
         Force a specific backend.
     device : str, optional
@@ -49,9 +56,12 @@ class ContinuousAccumulator:
         preserve_axes: Optional[Sequence[int]] = None,
         weights: Optional[Any] = None,
         climatology: Optional[Any] = None,
+        weight_mode: str = "mean",
         backend: Optional[str] = None,
         device: Any = None,
     ):
+        check_weight_mode(weight_mode)
+        self._weight_mode = weight_mode
         unknown = set(metrics) - self._VALID
         if unknown:
             raise ValueError(f"Unknown metrics: {unknown}. Valid: {self._VALID}")
@@ -131,7 +141,7 @@ class ContinuousAccumulator:
             chunk_err = xp.sum(be, axis=axes)
             self._sum_err = chunk_err if self._sum_err is None else self._sum_err + chunk_err
 
-        if weights is not None:
+        if weights is not None and self._weight_mode == "mean":
             chunk_w = xp.sum(weights, axis=axes)
         else:
             ones = xp.ones_like(fcst)
@@ -172,27 +182,32 @@ class ContinuousAccumulator:
         xp = get_namespace(self._count)
         results: dict[str, Any] = {}
 
-        safe_count = xp.where(
-            self._count > 0, self._count, xp.ones_like(self._count),
-        )
+        # 累计权重和（或点数）为 0 的位置没有定义，返回 NaN 而不是 0（与函数式 API 一致）
+        valid = self._count > 0
+        safe_count = xp.where(valid, self._count, xp.ones_like(self._count))
+
+        def _mean(total):
+            return xp.where(valid, total / safe_count, xp.zeros_like(total) + float("nan"))
 
         if self._need_sq:
-            mean_sq = self._sum_sq / safe_count
+            mean_sq = _mean(self._sum_sq)
             if "mse" in self.metrics:
                 results["mse"] = mean_sq
             if "rmse" in self.metrics:
                 results["rmse"] = xp.sqrt(mean_sq)
 
         if self._need_abs:
-            results["mae"] = self._sum_abs / safe_count
+            results["mae"] = _mean(self._sum_abs)
 
         if self._need_err:
-            results["bias"] = self._sum_err / safe_count
+            results["bias"] = _mean(self._sum_err)
 
         if self._need_acc:
             den = xp.sqrt(self._acc_ff * self._acc_oo)
             safe_den = xp.where(den > 0, den, xp.ones_like(den))
-            results["acc"] = self._acc_fo / safe_den
+            # 与 metvane.acc 相同：分母为 0（权重和为 0 或距平恒为 0）-> NaN
+            results["acc"] = xp.where(den > 0, self._acc_fo / safe_den,
+                                      xp.zeros_like(den) + float("nan"))
 
         return results
 

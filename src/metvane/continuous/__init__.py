@@ -35,6 +35,7 @@ def rmse(
     axis: Any = None,
     weights: Optional[Any] = None,
     skipna: bool = True,
+    weight_mode: str = "mean",
     backend: Optional[str] = None,
     device: Any = None,
 ) -> Any:
@@ -50,6 +51,12 @@ def rmse(
         Weighting array (e.g. latitude weights).
     skipna : bool
         Skip NaN values.
+    weight_mode : {'mean', 'multiply'}
+        ``'mean'`` (default): ``sum(w*x)/sum(w)`` over reduced axes; weights
+        cancel along preserved axes.  ``'multiply'``: ``sum(w*x)/n`` — weights
+        are kept on preserved axes (e.g. per-grid latitude-weighted fields,
+        eval_xrv4 ``multiply_mean1``); identical to ``'mean'`` when a global
+        latitude axis with mean-normalized weights is fully reduced.
     backend : {'numpy', 'torch'}, optional
         Force a specific backend.
     device : str, optional
@@ -58,34 +65,41 @@ def rmse(
     fcst, obs = _prepare(fcst, obs, backend=backend, device=device)
     if weights is not None:
         (weights,) = _prepare(weights, backend=backend, device=device)
-    return _impl.rmse(fcst, obs, axis=axis, weights=weights, skipna=skipna)
+    return _impl.rmse(fcst, obs, axis=axis, weights=weights, skipna=skipna,
+                      weight_mode=weight_mode)
 
 
 def mse(fcst: Any, obs: Any, *, axis: Any = None, weights: Any = None,
-        skipna: bool = True, backend: Any = None, device: Any = None) -> Any:
-    """Mean Squared Error."""
+        skipna: bool = True, weight_mode: str = "mean", backend: Any = None,
+        device: Any = None) -> Any:
+    """Mean Squared Error. ``weight_mode`` as in :func:`rmse`."""
     fcst, obs = _prepare(fcst, obs, backend=backend, device=device)
     if weights is not None:
         (weights,) = _prepare(weights, backend=backend, device=device)
-    return _impl.mse(fcst, obs, axis=axis, weights=weights, skipna=skipna)
+    return _impl.mse(fcst, obs, axis=axis, weights=weights, skipna=skipna,
+                      weight_mode=weight_mode)
 
 
 def mae(fcst: Any, obs: Any, *, axis: Any = None, weights: Any = None,
-        skipna: bool = True, backend: Any = None, device: Any = None) -> Any:
-    """Mean Absolute Error."""
+        skipna: bool = True, weight_mode: str = "mean", backend: Any = None,
+        device: Any = None) -> Any:
+    """Mean Absolute Error. ``weight_mode`` as in :func:`rmse`."""
     fcst, obs = _prepare(fcst, obs, backend=backend, device=device)
     if weights is not None:
         (weights,) = _prepare(weights, backend=backend, device=device)
-    return _impl.mae(fcst, obs, axis=axis, weights=weights, skipna=skipna)
+    return _impl.mae(fcst, obs, axis=axis, weights=weights, skipna=skipna,
+                      weight_mode=weight_mode)
 
 
 def bias(fcst: Any, obs: Any, *, axis: Any = None, weights: Any = None,
-         skipna: bool = True, backend: Any = None, device: Any = None) -> Any:
-    """Additive bias (forecast minus observation)."""
+        skipna: bool = True, weight_mode: str = "mean", backend: Any = None,
+        device: Any = None) -> Any:
+    """Additive bias (forecast minus observation). ``weight_mode`` as in :func:`rmse`."""
     fcst, obs = _prepare(fcst, obs, backend=backend, device=device)
     if weights is not None:
         (weights,) = _prepare(weights, backend=backend, device=device)
-    return _impl.bias(fcst, obs, axis=axis, weights=weights, skipna=skipna)
+    return _impl.bias(fcst, obs, axis=axis, weights=weights, skipna=skipna,
+                      weight_mode=weight_mode)
 
 
 def acc(fcst: Any, obs: Any, climatology: Any, *, axis: Any = None,
@@ -112,7 +126,7 @@ def pearson_correlation(
 
 def wind_vector_rmse(
     u_fcst: Any, v_fcst: Any, u_obs: Any, v_obs: Any, *,
-    axis: Any = None, weights: Any = None,
+    axis: Any = None, weights: Any = None, weight_mode: str = "mean",
     backend: Any = None, device: Any = None,
 ) -> Any:
     """Wind vector RMSE."""
@@ -123,4 +137,5 @@ def wind_vector_rmse(
         (weights,) = _prepare(weights, backend=backend, device=device)
     return _impl.wind_vector_rmse(
         u_fcst, v_fcst, u_obs, v_obs, axis=axis, weights=weights,
+        weight_mode=weight_mode,
     )
