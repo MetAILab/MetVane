@@ -84,6 +84,16 @@ class NumpyNS:
         return float(x)
 
 
+def _is_empty_axis(axis: Any) -> bool:
+    """``axis=()`` means "reduce over no axes" (numpy semantics).
+
+    ``torch.sum(x, dim=())`` instead reduces over *all* dims, so the torch
+    namespace must special-case it — otherwise a fully preserved grid
+    (e.g. per-grid-point statistics) silently collapses to a scalar on GPU.
+    """
+    return axis is not None and not isinstance(axis, int) and len(tuple(axis)) == 0
+
+
 class TorchNS:
     """Torch array namespace — only instantiated when torch is available."""
 
@@ -104,12 +114,17 @@ class TorchNS:
         import torch
         if axis is None:
             return torch.sum(x)
+        if _is_empty_axis(axis):
+            # numpy: np.sum(x, axis=()) is an element-wise copy (bool -> int64)
+            return x.to(torch.int64) if x.dtype == torch.bool else x.clone()
         return torch.sum(x, dim=axis)
 
     @staticmethod
     def mean(x: Any, axis: Any = None) -> Any:
         if axis is None:
             return x.float().mean()
+        if _is_empty_axis(axis):
+            return x.float().clone()
         return x.float().mean(dim=axis)
 
     @staticmethod
@@ -117,6 +132,8 @@ class TorchNS:
         import torch
         if axis is None:
             return torch.nanmean(x.float())
+        if _is_empty_axis(axis):
+            return x.float().clone()          # NaN stays NaN, as np.nanmean(x, axis=())
         return torch.nanmean(x.float(), dim=axis)
 
     @staticmethod
@@ -124,6 +141,8 @@ class TorchNS:
         import torch
         if axis is None:
             return torch.nansum(x)
+        if _is_empty_axis(axis):
+            return torch.where(torch.isnan(x), torch.zeros_like(x), x)   # np.nansum(x, axis=()) -> NaN->0
         return torch.nansum(x, dim=axis)
 
     @staticmethod

@@ -5,7 +5,7 @@
 所有函数共享统一签名：
 
 ```python
-metric(fcst, obs, *, axis=None, weights=None, skipna=True, backend=None, device=None)
+metric(fcst, obs, *, axis=None, weights=None, skipna=True, weight_mode="mean", backend=None, device=None)
 ```
 
 **参数说明：**
@@ -14,9 +14,10 @@ metric(fcst, obs, *, axis=None, weights=None, skipna=True, backend=None, device=
 |------|------|------|
 | `fcst` | array-like | 预报数据（numpy/torch/xarray） |
 | `obs` | array-like | 观测数据 |
-| `axis` | int or tuple | 聚合维度，`None` 表示全部 |
-| `weights` | array-like | 权重数组（如纬度权重） |
+| `axis` | int or tuple | 聚合维度，`None` 表示全部，`()` 表示不归约（逐格点） |
+| `weights` | array-like | 权重数组（如纬度权重）；权重和为 0（如区域掩码外）的切片返回 NaN |
 | `skipna` | bool | 是否跳过 NaN |
+| `weight_mode` | str | `"mean"`（默认）：Σ(w·x)/Σw；`"multiply"`：Σ(w·x)/N，在被保留的维上保留权重（见 README“全网格评估”） |
 | `backend` | str | 强制使用 `'numpy'` 或 `'torch'` |
 | `device` | str | Torch 设备（仅 backend='torch' 时有效） |
 
@@ -145,6 +146,7 @@ acc = metvane.ContinuousAccumulator(
     metrics=["rmse", "mae", "bias"],
     preserve_axes=[0],
     weights=w,
+    weight_mode="mean",      # 或 "multiply"；preserve_axes 覆盖全部轴 = 逐格点累加
     backend="torch",
     device="cuda",
 )
@@ -186,7 +188,7 @@ Backend.NUMPY
 ### metvane.latitude_weights
 
 ```python
->>> w = metvane.latitude_weights(lat, normalize=True)
+>>> w = metvane.latitude_weights(lat, normalize=True)   # cos(lat)/mean；内部 float64 计算，返回 lat 的浮点精度
 ```
 
 ### metvane.broadcast_weights
@@ -216,6 +218,10 @@ import metvane.xr_api as mxr
 mxr.rmse(fcst_da, obs_da, preserve_dims="lead_time")
 mxr.mae(fcst_da, obs_da, reduce_dims=["lat", "lon"])
 mxr.acc(fcst_da, obs_da, clim_da, preserve_dims="lead_time")
+mxr.rmse(fcst_da, obs_da, preserve_dims="all")                         # 不归约，保留全部维与坐标
+mxr.rmse(fcst_da, obs_da, reduce_dims="time", weights=w_da, weight_mode="multiply")
 ```
+
+结果保留未被归约的维（原顺序）及只依赖这些维的坐标，无论用 `reduce_dims` 还是 `preserve_dims` 指定。
 
 支持 `xr.Dataset` 自动遍历所有变量。

@@ -39,20 +39,30 @@ def latitude_weights(
 
     Returns
     -------
-    Same type as *lat* (numpy or torch).
+    Same type as *lat* (numpy or torch), in *lat*'s floating dtype
+    (float64 for integer / list input; float32 for integer tensors).
+
+    Notes
+    -----
+    Cosines are always evaluated in float64 and cast back afterwards:
+    in float32, ``cos(deg2rad(90))`` is -4.4e-8 and would be clipped to 0,
+    giving the polar rows zero weight (a latitude-preserving weighted mean
+    then returns 0 there).  In float64 it is 6.1e-17 > 0.
     """
-    xp = get_namespace(lat)
-    lat_f = xp.as_float(lat) if hasattr(lat, "dtype") else lat
-    w = np.cos(np.deg2rad(convert(lat_f, Backend.NUMPY)))
+    lat_np = np.asarray(convert(lat, Backend.NUMPY))
+    w = np.cos(np.deg2rad(lat_np.astype(np.float64)))
     w = np.clip(w, 0.0, None)
     if normalize:
         w = w / w.mean()
     try:
         import torch
         if isinstance(lat, torch.Tensor):
-            return torch.as_tensor(w, dtype=torch.float32, device=lat.device)
+            dtype = lat.dtype if lat.is_floating_point() else torch.float32
+            return torch.as_tensor(w, dtype=dtype, device=lat.device)
     except ImportError:
         pass
+    if np.issubdtype(lat_np.dtype, np.floating):
+        return w.astype(lat_np.dtype)
     return w
 
 
