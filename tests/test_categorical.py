@@ -50,7 +50,7 @@ class TestContingencyTableNumpy:
         table = ContingencyTable(fcst, obs, thresholds=[20])
         summary = table.summary()
         expected_keys = {"csi", "pod", "far", "pofd", "hss", "ets",
-                         "bias_score", "f1", "accuracy"}
+                         "bias_score", "f1", "pc"}
         assert set(summary.keys()) == expected_keys
 
     def test_hss_perfect(self):

@@ -1,223 +1,218 @@
-"""Continuous metric accumulator — chunked update / compute pattern.
+"""Continuous metric accumulator — chunked ``update`` / ``compute``.
 
-Internally maintains running sums of squared errors, absolute errors, etc.
-RMSE and MSE share the same squared-error state (statistic de-duplication).
+Uses the same weighted sums as the functional API (:func:`metvane.continuous._impl.weighted_sums`),
+so for chunks split along reduced axes the result equals the one-shot functional result,
+including NaN handling (``skipna``), weights, ``weight_mode`` and zero-weight → NaN.
+State is float64.
 """
 
 from __future__ import annotations
 
+import warnings
 from typing import Any, Optional, Sequence
 
+from ..continuous._impl import (check_weight_mode, correlation_from_sums, correlation_sums,
+                                multiply_mode_check, weighted_sums)
 from ..core.array_ns import get_namespace
-from ..core.backend import Backend, convert, detect_backend, ensure_same_backend
-from ..core.typing import normalize_axis
-from ..continuous._impl import check_weight_mode
+from ..core.prepare import (align_mask, align_to, check_same_shape, normalize_axis, normalize_metrics,
+                            safe_divide, validity)
+from ._base import AccumulatorBase
 
 
-class ContinuousAccumulator:
+class ContinuousAccumulator(AccumulatorBase):
     """Accumulator for continuous metrics over multiple data chunks.
 
     Parameters
     ----------
-    metrics : sequence of str
-        Metrics to compute, e.g. ``['rmse', 'mse', 'mae', 'bias']``.
-    preserve_axes : sequence of int, optional
-        Axes to **keep** in the output.  All other axes are reduced.
-    weights : array-like, optional
-        Spatial weights (e.g. latitude weights).  Must be broadcastable
-        to the data shape.
-    climatology : array-like, optional
-        Climatology array — required when ``'acc'`` is in *metrics*.
+    metrics : str or sequence of str
+        Any of ``'rmse', 'mse', 'mae', 'bias', 'acc', 'acc_mean'``.
+        ``'acc'`` is the pooled ACC over all reduced axes; ``'acc_mean'`` is the mean over
+        samples of the per-sample ACC computed over *spatial_axes* (WeatherBench-2 / ECMWF
+        convention).
+    axis : int or tuple, optional
+        Axes to reduce (as in the functional API).  Mutually exclusive with *preserve_axes*.
+    preserve_axes : int or tuple, optional
+        Axes to keep; all others are reduced.  Default (neither given): reduce everything.
+        **Chunks may only be split along reduced axes** (checked).
+    weights : array, optional
+        Default weights, broadcastable to every chunk (e.g. ``latitude_weights(lat)[:, None]``);
+        converted to each chunk's backend/device.  ``update(weights=...)`` overrides it.
+    climatology : array or scalar, optional
+        Static climatology for ACC (broadcast to every chunk).  For time-varying climatology
+        pass ``update(climatology=...)`` with each chunk instead.
+    spatial_axes : int or tuple, optional
+        Axes pooled into one ACC per sample for ``'acc_mean'`` (must be reduced axes).
     weight_mode : {'mean', 'multiply'}
-        How *weights* enter rmse/mse/mae/bias (see :func:`metvane.rmse`):
-        ``'mean'`` (default) normalizes by the summed weights over reduced axes;
-        ``'multiply'`` divides by the number of points, keeping weights on
-        preserved axes.  Preserving every axis (``preserve_axes`` = all) gives
-        per-grid-point statistics accumulated over chunks.
-    backend : {'numpy', 'torch'}, optional
-        Force a specific backend.
-    device : str, optional
-        Torch device.
+        As in :func:`metvane.rmse`.
+    skipna : bool, default True
+        Exclude NaN points (as the functional API).
+    backend, device : optional
+        Force a backend (``device`` only with ``backend='torch'``).
 
     Examples
     --------
-    >>> acc = ContinuousAccumulator(['rmse', 'mae'], preserve_axes=[0])
-    >>> for chunk_f, chunk_o in data_loader:
-    ...     acc.update(chunk_f, chunk_o)
-    >>> result = acc.compute()   # {'rmse': array, 'mae': array}
+    >>> acc = ContinuousAccumulator(['rmse', 'acc'], preserve_axes=[1],
+    ...                             weights=latitude_weights(lat)[:, None])
+    >>> for f, o, c in loader:            # chunks of (n_init, n_lead, lat, lon), split along init
+    ...     acc.update(f, o, climatology=c)
+    >>> acc.compute()                     # {'rmse': (n_lead,), 'acc': (n_lead,)}
     """
 
-    _VALID = {"rmse", "mse", "mae", "bias", "acc"}
+    _VALID = {"rmse", "mse", "mae", "bias", "acc", "acc_mean"}
 
     def __init__(
         self,
-        metrics: Sequence[str] = ("rmse",),
+        metrics: Any = ("rmse",),
         *,
+        axis: Any = None,
         preserve_axes: Optional[Sequence[int]] = None,
         weights: Optional[Any] = None,
         climatology: Optional[Any] = None,
+        spatial_axes: Any = None,
         weight_mode: str = "mean",
+        skipna: bool = True,
         backend: Optional[str] = None,
         device: Any = None,
     ):
         check_weight_mode(weight_mode)
+        self.metrics = normalize_metrics(metrics, self._VALID)
         self._weight_mode = weight_mode
-        unknown = set(metrics) - self._VALID
-        if unknown:
-            raise ValueError(f"Unknown metrics: {unknown}. Valid: {self._VALID}")
-
-        self.metrics = tuple(metrics)
-        self.preserve_axes = (
-            tuple(preserve_axes) if preserve_axes is not None else None
-        )
+        self._skipna = bool(skipna)
         self._weights = weights
         self._climatology = climatology
-        self._forced_backend = backend
-        self._device = device
+        self._spatial_arg = spatial_axes
+        if "acc_mean" in self.metrics and spatial_axes is None:
+            raise ValueError("'acc_mean' 需要 spatial_axes=（每个样本内做空间相关的轴，如 (-2, -1)）")
+        self._need_sq = bool({"rmse", "mse"} & set(self.metrics))
+        self._need_abs = "mae" in self.metrics
+        self._need_err = "bias" in self.metrics
+        self._need_acc = "acc" in self.metrics
+        self._need_accm = "acc_mean" in self.metrics
+        super().__init__(axis=axis, preserve_axes=preserve_axes, backend=backend, device=device)
 
-        self._need_sq = "rmse" in metrics or "mse" in metrics
-        self._need_abs = "mae" in metrics
-        self._need_err = "bias" in metrics
-        self._need_acc = "acc" in metrics
+    def _config(self) -> dict:
+        c = super()._config()
+        c.update(metrics=self.metrics, weight_mode=self._weight_mode, skipna=self._skipna,
+                 spatial_axes=self._spatial_arg if self._spatial_arg is None or isinstance(self._spatial_arg, int)
+                 else tuple(self._spatial_arg))
+        return c
 
-        self._sum_sq: Optional[Any] = None
-        self._sum_abs: Optional[Any] = None
-        self._sum_err: Optional[Any] = None
-        self._count: Optional[Any] = None
+    def _extra_reset(self) -> None:
+        self._clim_mode: Optional[str] = None
+        self._warned_static = False
 
-        self._acc_fo: Optional[Any] = None
-        self._acc_ff: Optional[Any] = None
-        self._acc_oo: Optional[Any] = None
-        self._acc_count: Optional[Any] = None
+    def _merge_extra(self, other) -> None:
+        if self._clim_mode is None:
+            self._clim_mode = other._clim_mode
 
-    def _reduce_axes(self, ndim: int) -> tuple[int, ...]:
-        if self.preserve_axes is None:
-            return tuple(range(ndim))
-        keep = {a % ndim for a in self.preserve_axes}
-        return tuple(i for i in range(ndim) if i not in keep)
+    def update(self, fcst: Any, obs: Any, *, climatology: Optional[Any] = None,
+               weights: Optional[Any] = None, mask: Optional[Any] = None) -> None:
+        """Accumulate one chunk.
 
-    def update(self, fcst: Any, obs: Any) -> None:
-        """Accumulate statistics from one chunk."""
-        if self._forced_backend:
-            target = Backend(self._forced_backend)
-            fcst = convert(fcst, target, device=self._device)
-            obs = convert(obs, target, device=self._device)
+        Parameters
+        ----------
+        fcst, obs : arrays of identical shape (numpy or torch)
+        climatology : optional per-chunk climatology (takes precedence over the constructor's);
+            must correspond to each verification time of the chunk.
+        weights : optional per-chunk weights (take precedence over the constructor's).
+        mask : optional boolean evaluation mask for this chunk.
 
-        fcst, obs = ensure_same_backend(fcst, obs)
-        xp = get_namespace(fcst)
-        fcst, obs = xp.as_float(fcst), xp.as_float(obs)
-        axes = self._reduce_axes(fcst.ndim)
+        All validation happens before any state is modified (atomic update).
+        """
+        need_clim = self._need_acc or self._need_accm
+        if need_clim:
+            if climatology is None and self._climatology is None:
+                raise ValueError("ACC 需要 climatology：请在构造时给出静态气候态，或 update(climatology=...) 逐块传入")
+            mode = "chunk" if climatology is not None else "static"
+            if self._clim_mode is not None and mode != self._clim_mode:
+                raise ValueError(f"气候态用法不一致：之前为 {self._clim_mode!r}，本块为 {mode!r}")
+        w_in = weights if weights is not None else self._weights
+        c_in = climatology if climatology is not None else self._climatology
 
-        weights = self._weights
-        if weights is not None:
-            weights = convert(
-                weights,
-                Backend.TORCH if xp.name == "torch" else Backend.NUMPY,
-                device=getattr(fcst, "device", None),
-            )
-            weights = xp.as_float(weights)
-            weights = xp.broadcast_to(weights, fcst.shape)
+        fcst, obs, w_in, c_in, mask = self._inputs(fcst, obs, w_in, c_in, mask)
+        xp = get_namespace(fcst, obs)
+        f, o = xp.as_float(fcst), xp.as_float(obs)
+        check_same_shape(f, ("obs", o))
+        shape = tuple(f.shape)
+        red = self._reduced_axes(f.ndim)
+        kept = self._check_kept(shape, red)
+        w = align_to(w_in, f, xp, name="weights")
+        m = align_mask(mask, f, xp)
+        f64 = xp.float64
+        chunk: dict[str, Any] = {}
 
-        err = fcst - obs
+        err = f - o
+        valid = validity(xp, err, w, mask=m, skipna=self._skipna)
+        if self._weight_mode == "multiply" and (self._need_sq or self._need_abs or self._need_err):
+            multiply_mode_check(xp, w, valid, shape, red)
+        den = None
+        for key, need, x in (("sum_sq", self._need_sq, lambda: err * err),
+                             ("sum_abs", self._need_abs, lambda: xp.abs(err)),
+                             ("sum_err", self._need_err, lambda: err)):
+            if need:
+                num, d = weighted_sums(xp, x(), axis=red, weights=w, valid=valid,
+                                       weight_mode=self._weight_mode, dtype=f64)
+                chunk[key] = num
+                den = d if den is None else den
+        if den is not None:
+            chunk["count"] = den
 
-        if self._need_sq:
-            se = err ** 2
-            if weights is not None:
-                se = se * weights
-            chunk_sq = xp.sum(se, axis=axes)
-            self._sum_sq = chunk_sq if self._sum_sq is None else self._sum_sq + chunk_sq
+        if need_clim:
+            c = align_to(c_in, f, xp, name="climatology")
+            if mode == "static" and not self._warned_static and len(c.shape) > 0:
+                cshape = (1,) * (f.ndim - len(c.shape)) + tuple(c.shape)
+                if any(cshape[a] == 1 and shape[a] > 1 for a in red):
+                    warnings.warn("静态气候态沿被归约的轴（如起报/验证时间）广播：若块内包含不同验证时刻，"
+                                  "季节循环会进入距平、ACC 被高估；时变气候态请用 update(climatology=...)",
+                                  UserWarning, stacklevel=2)
+                self._warned_static = True
+            fa, oa = f - c, o - c
+            va = validity(xp, fa, oa, w, mask=m, skipna=self._skipna)
+            if self._need_acc:
+                s = correlation_sums(xp, fa, oa, axis=red, weights=w, valid=va, centered=False, dtype=f64)
+                chunk.update(acc_fo=s["fo"], acc_ff=s["ff"], acc_oo=s["oo"])
+            if self._need_accm:
+                sp = normalize_axis(self._spatial_arg, f.ndim, name="spatial_axes")
+                if not set(sp) <= set(red):
+                    raise ValueError(f"spatial_axes={sp} 必须是被归约的轴 {red} 的子集")
+                s = correlation_sums(xp, fa, oa, axis=sp, weights=w, valid=va, centered=False,
+                                     dtype=f64, keepdims=True)
+                score = correlation_from_sums(xp, s, centered=False)
+                rest = tuple(a for a in red if a not in sp)
+                ok = ~xp.isnan(score)
+                sc = xp.where(ok, score, xp.zeros_like(score))
+                full = tuple(1 if a in sp else shape[a] for a in range(f.ndim))
+                okb = ok if tuple(ok.shape) == full else xp.broadcast_to(ok, full)
+                chunk["accm_sum"] = _squeeze(xp, xp.sum(sc, rest, keepdims=True, dtype=f64), sp + rest)
+                chunk["accm_n"] = _squeeze(xp, xp.sum(okb, rest, keepdims=True, dtype=f64), sp + rest)
+            self._clim_mode = mode
 
-        if self._need_abs:
-            ae = xp.abs(err)
-            if weights is not None:
-                ae = ae * weights
-            chunk_abs = xp.sum(ae, axis=axes)
-            self._sum_abs = chunk_abs if self._sum_abs is None else self._sum_abs + chunk_abs
-
-        if self._need_err:
-            be = err
-            if weights is not None:
-                be = be * weights
-            chunk_err = xp.sum(be, axis=axes)
-            self._sum_err = chunk_err if self._sum_err is None else self._sum_err + chunk_err
-
-        if weights is not None and self._weight_mode == "mean":
-            chunk_w = xp.sum(weights, axis=axes)
-        else:
-            ones = xp.ones_like(fcst)
-            chunk_w = xp.sum(ones, axis=axes)
-        self._count = chunk_w if self._count is None else self._count + chunk_w
-
-        if self._need_acc:
-            clim = self._climatology
-            if clim is None:
-                raise ValueError("climatology is required for ACC")
-            clim = convert(
-                clim,
-                Backend.TORCH if xp.name == "torch" else Backend.NUMPY,
-                device=getattr(fcst, "device", None),
-            )
-            clim = xp.as_float(clim)
-            f_anom = fcst - clim
-            o_anom = obs - clim
-
-            w = weights if weights is not None else xp.ones_like(fcst)
-            chunk_fo = xp.sum(w * f_anom * o_anom, axis=axes)
-            chunk_ff = xp.sum(w * f_anom ** 2, axis=axes)
-            chunk_oo = xp.sum(w * o_anom ** 2, axis=axes)
-
-            self._acc_fo = chunk_fo if self._acc_fo is None else self._acc_fo + chunk_fo
-            self._acc_ff = chunk_ff if self._acc_ff is None else self._acc_ff + chunk_ff
-            self._acc_oo = chunk_oo if self._acc_oo is None else self._acc_oo + chunk_oo
-            if self._acc_count is None:
-                self._acc_count = chunk_w.copy() if hasattr(chunk_w, "copy") else chunk_w
-            else:
-                self._acc_count = self._acc_count + chunk_w
+        self._commit(chunk, f.ndim, red, kept)
 
     def compute(self) -> dict[str, Any]:
-        """Derive final metrics from accumulated states."""
-        if self._count is None:
-            raise RuntimeError("No data has been accumulated. Call update() first.")
-
-        xp = get_namespace(self._count)
-        results: dict[str, Any] = {}
-
-        # 累计权重和（或点数）为 0 的位置没有定义，返回 NaN 而不是 0（与函数式 API 一致）
-        valid = self._count > 0
-        safe_count = xp.where(valid, self._count, xp.ones_like(self._count))
-
-        def _mean(total):
-            return xp.where(valid, total / safe_count, xp.zeros_like(total) + float("nan"))
-
+        """Derive the metrics from the accumulated sums (NaN where undefined)."""
+        st = self._require_state()
+        xp = get_namespace(*st.values())
+        out: dict[str, Any] = {}
         if self._need_sq:
-            mean_sq = _mean(self._sum_sq)
+            mean_sq = safe_divide(xp, st["sum_sq"], st["count"])
             if "mse" in self.metrics:
-                results["mse"] = mean_sq
+                out["mse"] = mean_sq
             if "rmse" in self.metrics:
-                results["rmse"] = xp.sqrt(mean_sq)
-
+                out["rmse"] = xp.sqrt(mean_sq)
         if self._need_abs:
-            results["mae"] = _mean(self._sum_abs)
-
+            out["mae"] = safe_divide(xp, st["sum_abs"], st["count"])
         if self._need_err:
-            results["bias"] = _mean(self._sum_err)
-
+            out["bias"] = safe_divide(xp, st["sum_err"], st["count"])
         if self._need_acc:
-            den = xp.sqrt(self._acc_ff * self._acc_oo)
-            safe_den = xp.where(den > 0, den, xp.ones_like(den))
-            # 与 metvane.acc 相同：分母为 0（权重和为 0 或距平恒为 0）-> NaN
-            results["acc"] = xp.where(den > 0, self._acc_fo / safe_den,
-                                      xp.zeros_like(den) + float("nan"))
+            out["acc"] = correlation_from_sums(xp, {"fo": st["acc_fo"], "ff": st["acc_ff"], "oo": st["acc_oo"]},
+                                               centered=False)
+        if self._need_accm:
+            out["acc_mean"] = safe_divide(xp, st["accm_sum"], st["accm_n"])
+        return {k: out[k] for k in self.metrics}
 
-        return results
 
-    def reset(self) -> None:
-        """Clear all accumulated states."""
-        self._sum_sq = None
-        self._sum_abs = None
-        self._sum_err = None
-        self._count = None
-        self._acc_fo = None
-        self._acc_ff = None
-        self._acc_oo = None
-        self._acc_count = None
+def _squeeze(xp, x, axes):
+    for a in sorted(axes, reverse=True):
+        x = x.squeeze(a) if xp.name == "torch" else x.squeeze(axis=a)
+    return x

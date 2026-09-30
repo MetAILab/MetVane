@@ -2,193 +2,79 @@
 
 ## 1. 设计目标
 
-MetVane 旨在提供一个简洁、统一的气象评估框架，满足以下需求：
+- 中短期天气预报：RMSE、MAE、ACC、风矢量 RMSE 等回归指标
+- 短临预报：CSI、POD、FAR 等分类指标，FSS 空间指标
+- 多后端：NumPy、PyTorch（含 GPU）共用一套实现；xarray 层按维名/坐标对齐
+- 灵活聚合：整体 / 按预报时刻 / 按区域 / 逐格点
+- 大数据集：累加器分块处理，可跨进程合并
 
-- **中短期天气预报**：RMSE、MAE、ACC、风矢量 RMSE 等回归指标
-- **短临预报（临近预报）**：CSI、POD、FAR 等分类指标，FSS 空间指标
-- **多后端支持**：NumPy、PyTorch（含 GPU）、xarray
-- **灵活聚合**：整体 / 按预报时刻 / 按区域
-- **大数据集支持**：累加器模式，分块处理
+## 2. 分层
 
-## 2. 核心架构
-
-```
-                 用户 API
-          ┌──────────────────┐
-          │   metvane.rmse() │  函数式 API
-          │   metvane.csi()  │
-          └────────┬─────────┘
-                   │
-    ┌──────────────┼──────────────┐
-    │              │              │
-    ▼              ▼              ▼
-continuous/   categorical/   spatial/      指标子包
-_impl.py      _impl.py      _impl.py
-    │              │              │
-    └──────────────┼──────────────┘
-                   │
-          ┌────────┴─────────┐
-          │  core/array_ns   │  命名空间适配器
-          │  get_namespace() │
-          └────────┬─────────┘
-                   │
-          ┌────────┴─────────┐
-          │  NumpyNS  或     │
-          │  TorchNS         │
-          └──────────────────┘
+```text
+          metvane.rmse / csi / fss / ...        函数式 API（numpy / torch）
+          metvane.xr_api.*                      xarray 层（对齐 + xarray 原生运算，dask 惰性）
+          *Accumulator                          分块累加
+                     │
+          core/prepare.py                       统一输入准备层
+          ├─ resolve_backend / prepare          后端、设备、dtype 规则，拒绝 xarray
+          ├─ normalize_axis                     轴规范化（负轴、越界、重复、() = 不归约）
+          ├─ check_same_shape                   禁止隐式广播
+          ├─ align_to / align_mask              权重、气候态、掩码转到数据的后端/设备/dtype，并做广播检查
+          ├─ validity                           NaN / 掩码 → 有效掩码（inf 是数值）
+          └─ safe_divide                        零分母 → NaN
+                     │
+          continuous/_impl.weighted_sums        共享的充分统计量（函数式与累加器共用）
+          continuous/_impl.correlation_sums
+          categorical/_impl.compute_contingency int64 计数
+          spatial/_impl.fss_components          积分图、可池化分量
+                     │
+          core/array_ns (NumpyNS / TorchNS)     只封装 numpy 与 torch 有差异的操作
 ```
 
-## 3. 命名空间适配器 (array_ns)
+## 3. 命名空间适配器（array_ns）
 
-这是 MetVane 最核心的设计创新。
+`get_namespace(*arrays)` 返回 `NumpyNS` 或 `TorchNS`；指标实现只调用 `xp.sum(x, axis, keepdims=, dtype=)`、`xp.where`、`xp.nan_like` 等统一接口。
+torch 下 `axis=()` 被特殊处理为"不归约"（`torch.sum(dim=())` 会归约全部维）。
 
-### 问题
+dtype 规则（`as_float`）：float16/bfloat16 → float32；float32/float64 保持（torch 不降精度）；整数/布尔 → float64（numpy）/ float32（torch）；MaskedArray → 掩码处为 NaN。
 
-NumPy 和 PyTorch 的 API 存在差异：
+## 4. 统一的统计口径
 
-| 操作 | NumPy | PyTorch |
-|------|-------|---------|
-| 求和 | `np.sum(x, axis=0)` | `torch.sum(x, dim=0)` |
-| 广播 | `np.broadcast_to(x, shape)` | `x.expand(shape)` |
-| NaN 均值 | `np.nanmean(x)` | `torch.nanmean(x)` |
+| 规则 | 实现位置 |
+|---|---|
+| NaN = 缺测，`inf` = 数值 | `prepare.validity` |
+| 零分母 → NaN | `prepare.safe_divide`（双层 where，无 0/0 警告） |
+| 0 权重处不产生 0·inf | `weighted_sums` 先把 w==0 处的数据置 0 |
+| 分类计数 int64，分数 float64 | `compute_contingency`、`ContingencyTable._f64` |
+| 累加器状态 float64 | `weighted_sums(dtype=float64)` |
 
-### 解决方案
+函数式 API 与累加器调用同一个 `weighted_sums` / `correlation_sums`，因此沿被归约轴分块累加的结果与一次性计算一致（含 NaN、权重、`weight_mode`）。
 
-```python
-class NumpyNS:
-    @staticmethod
-    def sum(x, axis=None):
-        return np.sum(x, axis=axis)
+## 5. 累加器
 
-class TorchNS:
-    @staticmethod
-    def sum(x, axis=None):
-        return torch.sum(x, dim=axis)
+`accumulator/_base.AccumulatorBase` 提供：
+- `axis=` 与 `preserve_axes=` 互斥的轴解析；
+- 首块记录维数与保留轴长度，之后不一致即报错（防止沿保留轴分块被逐元素相加）；
+- 原子 `update`（统计量先算进局部变量，全部成功后再提交）；
+- `merge`（校验配置）、`state_dict` / `load_state_dict`（带版本号）、只读 `stats`。
 
-def get_namespace(*arrays):
-    # 自动检测输入类型，返回对应命名空间
+`ContinuousAccumulator` 支持逐块气候态（`update(climatology=...)`）和逐样本 ACC 平均（`acc_mean`）；`FSSAccumulator` 累加 FSS 的分子、分母与基率计数。
+
+## 6. xarray 层
+
+1. `align_inputs`：obs 同维校验并按 fcst 转置；坐标重排/子集选择（`join='reorder'|'exact'|'inner'`，数值坐标按 `coord_tol` 匹配）；气候态、权重、掩码在共享维上同样对齐。
+2. 维名校验（`reduce_dims` / `preserve_dims`，未知维名报错）。
+3. 用 xarray 原生运算计算加权和，再求比值；在 `xr.set_options(arithmetic_join="exact")` 下运算，避免隐式内连接。dask 输入保持惰性。
+
+## 7. 数据流
+
+```text
+输入 (numpy / torch)
+  → resolve_backend / ensure_same_backend（拒绝 xarray；多个 torch 输入须在同一设备）
+  → as_float（dtype 规则）
+  → normalize_axis / check_same_shape / align_to / align_mask
+  → validity
+  → weighted_sums / correlation_sums / compute_contingency / fss_components
+  → safe_divide
+  → 结果（与输入同后端、同设备）
 ```
-
-### 效果
-
-- 所有指标只需写 **一套代码**
-- 使用 `xp = get_namespace(fcst)` 获取适配器
-- 然后用 `xp.sum()`, `xp.mean()` 等统一接口
-- NumPy 和 PyTorch 自动切换
-
-## 4. 后端检测与转换 (backend)
-
-```python
-# 自动检测
-metvane.detect_backend(numpy_array)    # → Backend.NUMPY
-metvane.detect_backend(torch_tensor)   # → Backend.TORCH
-metvane.detect_backend(xr_dataarray)   # → Backend.XARRAY
-
-# 显式转换
-metvane.convert(numpy_array, Backend.TORCH, device="cuda")
-
-# 确保同后端
-fcst, obs = ensure_same_backend(fcst, obs)
-# 如果有一个是 torch，全部提升为 torch
-```
-
-## 5. 指标分类
-
-### 5.1 回归指标 (continuous/)
-
-```
-_impl.py → rmse(), mse(), mae(), bias(), acc(), pearson_correlation(), wind_vector_rmse()
-```
-
-所有函数共享 `_weighted_mean()` 内部工具，支持加权和 NaN 跳过。
-
-### 5.2 分类指标 (categorical/)
-
-```
-_impl.py → compute_contingency()  → TP, FP, FN, TN
-__init__.py → ContingencyTable 类  → csi(), pod(), far(), hss(), ets(), ...
-```
-
-ContingencyTable 一次性计算列联表，然后按需查询任意分数。
-
-### 5.3 空间指标 (spatial/)
-
-```
-_impl.py → fss()  → Fractions Skill Score
-```
-
-使用累积和实现高效的 2D 均匀滤波器。
-
-### 5.4 概率指标 (probabilistic/)
-
-```
-_impl.py → crps_ensemble(), brier_score()
-```
-
-## 6. 累加器模式
-
-对于无法一次性加载到内存的大数据集：
-
-```python
-# 连续指标累加器
-acc = ContinuousAccumulator(["rmse", "mae"], preserve_axes=[0])
-for chunk in loader:
-    acc.update(chunk_fcst, chunk_obs)
-result = acc.compute()
-
-# 分类指标累加器
-ca = ContingencyAccumulator([20, 35, 40], preserve_axes=[0])
-for chunk in loader:
-    ca.update(chunk_fcst, chunk_obs)
-result = ca.compute()
-```
-
-**关键设计**：累加器只维护中间统计量（平方误差和、绝对误差和、计数等），而非原始数据。
-
-## 7. xarray 便捷层
-
-```python
-import metvane.xr_api as mxr
-
-# 通过命名维度控制聚合
-mxr.rmse(fcst, obs, preserve_dims="lead_time")
-mxr.rmse(fcst, obs, reduce_dims=["lat", "lon"])
-
-# 自动支持 xr.Dataset（多变量）
-mxr.rmse(fcst_ds, obs_ds, preserve_dims="lead_time")
-```
-
-## 8. 数据流
-
-```
-用户输入 (numpy/torch/xarray)
-    │
-    ▼
-detect_backend() → 检测后端
-    │
-    ▼
-ensure_same_backend() → 对齐后端
-    │
-    ▼
-get_namespace() → 获取适配器 (NumpyNS/TorchNS)
-    │
-    ▼
-_impl.py → 使用适配器执行计算
-    │
-    ▼
-返回结果 (同后端类型)
-```
-
-## 9. 与参考框架的对比
-
-| 特性 | WeatherBenchX | nci/scores | torchmetrics | **MetVane** |
-|------|:---:|:---:|:---:|:---:|
-| NumPy 支持 | ✗ (xarray) | ✓ (xarray) | ✗ (torch) | **✓** |
-| PyTorch 支持 | ✗ | ✗ | ✓ | **✓** |
-| xarray 支持 | ✓ | ✓ | ✗ | **✓** |
-| GPU 加速 | ✗ | ✗ | ✓ | **✓** |
-| 累加器模式 | ✗ | ✗ | ✓ | **✓** |
-| 气象专用权重 | ✓ | 部分 | ✗ | **✓** |
-| 分类指标 | 有限 | ✓ | ✓ | **✓** |
-| 空间指标 | ✗ | 有限 | ✗ | **✓** (FSS) |
-| 单套代码多后端 | N/A | N/A | N/A | **✓** (array_ns) |

@@ -11,191 +11,173 @@
 
 ## 特性
 
-- **多后端支持**：NumPy / PyTorch / xarray，自动检测数据格式，零代码切换
-- **GPU 加速**：PyTorch 张量自动在 GPU 上计算，无需额外配置
-- **命名空间适配器**：一套代码同时支持 NumPy 和 PyTorch，避免代码重复
-- **四类指标**：回归（连续）、分类、空间、概率
-- **灵活聚合**：整体评估、按预报时刻评估、区域评估、逐格点（全网格）评估
-- **累加器模式**：`update/compute` 模式支持超大数据集分块计算
-- **xarray 便捷层**：通过命名维度 (`preserve_dims` / `reduce_dims`) 轻松聚合
-- **气象工具**：纬度权重、区域掩码、广播权重
+- **多后端**：NumPy / PyTorch（CPU、CUDA）使用同一套实现；结果留在输入的后端与设备上
+- **xarray 层**：按维名和坐标对齐（纬度反序、维顺序不同都能正确配对），dask 输入保持惰性
+- **四类指标**：回归（连续）、分类、空间（FSS）、概率（实验性）
+- **统一的缺测规则**：NaN（以及 MaskedArray 的掩码）= 缺测，所有指标一致跳过；`inf` 视为数值
+- **累加器**：`update/compute` 分块计算，int64/float64 状态，支持 `merge`、`state_dict`
+- **气象工具**：纬度权重（cos / 单元面积）、区域掩码（0..360 与 -180..180 经度通用）
 
 ## 安装
 
 ```bash
-# 基础安装（仅 numpy）
-pip install -e .
-
-# 安装 PyTorch 支持
-pip install -e ".[torch]"
-
-# 安装 xarray 支持
-pip install -e ".[xarray]"
-
-# 安装全部依赖
-pip install -e ".[all]"
-
-# 开发模式（含测试依赖）
-pip install -e ".[dev]"
+cd MetVane
+pip install -e .              # 仅 numpy
+pip install -e ".[torch]"     # + PyTorch
+pip install -e ".[xarray]"    # + xarray
+pip install -e ".[dev]"       # 测试依赖
 ```
 
 ## 快速开始
 
-### 函数式 API（最简用法）
+### 函数式 API（numpy / torch）
 
 ```python
 import numpy as np
 import metvane
 
-fcst = np.random.randn(10, 181, 360).astype(np.float32)
-obs  = np.random.randn(10, 181, 360).astype(np.float32)
-lat  = np.linspace(-90, 90, 181, dtype=np.float32)
+rng = np.random.default_rng(0)
+lat = np.linspace(90, -90, 181)
+fcst = rng.standard_normal((4, 10, 181, 360)).astype(np.float32)   # (init, lead, lat, lon)
+obs = rng.standard_normal((4, 10, 181, 360)).astype(np.float32)
 
-# 纬度加权 RMSE，按预报时刻输出
-w = metvane.latitude_weights(lat)
-w = metvane.broadcast_weights(w, fcst.shape, lat_axis=-2)
-rmse = metvane.rmse(fcst, obs, axis=(1, 2), weights=w)
-# rmse.shape == (10,)
+w = metvane.latitude_weights(lat)[:, None]         # (nlat, 1)：沿纬度广播
+rmse = metvane.rmse(fcst, obs, axis=(0, 2, 3), weights=w)          # (10,) 每个 lead 一个值
+acc = metvane.acc(fcst, obs, 0.0, axis=(2, 3), mean_over=0, weights=w)  # 逐起报空间 ACC 再平均
 ```
 
-### PyTorch + GPU
+> 1-D 纬度权重直接传给 N 维数据会被拒绝（numpy 会把它对齐到最后一维——经度）。请用
+> `w[:, None]` 或 `metvane.broadcast_weights(w, fcst.shape, lat_axis=-2)`。
+> fcst 与 obs 形状必须完全相同，不做隐式广播。
+
+### PyTorch / GPU
 
 ```python
 import torch
 import metvane
 
-fcst = torch.randn(10, 181, 360, device="cuda")
-obs  = torch.randn(10, 181, 360, device="cuda")
-rmse = metvane.rmse(fcst, obs, axis=(1, 2))
-# 结果自动保留在 GPU 上
+device = "cuda" if torch.cuda.is_available() else "cpu"
+f = torch.randn(10, 181, 360, device=device)
+o = torch.randn(10, 181, 360, device=device)
+w = metvane.latitude_weights(np.linspace(90, -90, 181))[:, None]   # numpy 权重自动转到数据设备
+metvane.rmse(f, o, axis=(1, 2), weights=w)          # 结果在同一设备上，float64 输入不降精度
 ```
 
-### xarray 命名维度
+### xarray（按维名与坐标对齐）
 
 ```python
 import xarray as xr
 import metvane.xr_api as mxr
 
-fcst = xr.DataArray(data, dims=["lead_time", "lat", "lon"])
-obs  = xr.DataArray(data, dims=["lead_time", "lat", "lon"])
-
-rmse = mxr.rmse(fcst, obs, preserve_dims="lead_time")
-# 自动沿 lat, lon 聚合，保留 lead_time 维度
+coords = {"lead_time": np.arange(10), "latitude": lat, "longitude": np.arange(360.0)}
+f_da = xr.DataArray(fcst[0], dims=("lead_time", "latitude", "longitude"), coords=coords)
+o_da = xr.DataArray(obs[0], dims=("lead_time", "latitude", "longitude"), coords=coords)
+o_da = o_da.sortby("latitude")                      # 纬度顺序不同：按坐标自动对齐
+w_da = metvane.latitude_weights(f_da.latitude)      # DataArray 权重
+mxr.rmse(f_da, o_da, preserve_dims="lead_time", weights=w_da)
 ```
 
-### 分类指标（短临预报）
+写错维名（如 `lat` vs `latitude`）会报错；dask 数据返回惰性结果（`.compute()` 求值）。
+
+### 分类指标（短临）
 
 ```python
-import metvane
-from metvane.categorical import ContingencyTable
+from metvane import ContingencyTable
 
-table = ContingencyTable(fcst, obs, thresholds=[20, 35, 40], axis=(1, 2))
-print(table.csi())     # shape: (3, n_leadtimes)
-print(table.pod())
-print(table.summary())  # 所有指标的字典
+radar_f = rng.uniform(0, 60, (6, 20, 64, 64))       # (case, lead, H, W) dBZ
+radar_o = rng.uniform(0, 60, (6, 20, 64, 64))
+radar_o[:, :, :8, :8] = np.nan                      # 雷达盲区 = 缺测，不计入任何计数
+
+table = ContingencyTable(radar_f, radar_o, thresholds=[20, 35, 40], axis=(0, 2, 3))
+table.csi().shape                                   # (3, 20)：(阈值, lead)
+scores = table.summary(["csi", "pod", "far", "frequency_bias"])
 ```
+
+### 累加器（只能沿被归约的轴分块）
+
+```python
+accum = metvane.ContinuousAccumulator(["rmse", "mae", "bias"], preserve_axes=[1], weights=w)
+for s in range(0, 4, 3):                            # 沿 init（轴 0，被归约）分块
+    accum.update(fcst[s:s + 3], obs[s:s + 3])
+res = accum.compute()                               # 与 metvane.rmse(..., axis=(0, 2, 3)) 相同
+np.testing.assert_allclose(res["rmse"], rmse, rtol=1e-5)
+```
+
+沿保留轴切分会被检测并报错（各块的保留轴长度必须一致）。
+
+## 评分口径
+
+| 主题 | MetVane 的约定 |
+|---|---|
+| 缺测 | NaN / MaskedArray 掩码 / `mask=False` 的点从所有统计量中排除；`skipna=False` 时含 NaN 的切片为 NaN；`inf` 是数值（模式发散不会被掩盖） |
+| 零分母 | 无定义 → **NaN**（如无事件时的 CSI、两场都无事件时的 FSS、权重和为 0 的切片）；用 `nanmean` 汇总时会被跳过 |
+| RMSE 跨样本 | `sqrt(样本平均 MSE)`（WeatherBench 口径），不是逐样本 RMSE 的平均 |
+| ACC | 默认未中心化；`axis` 为空间轴、`mean_over` 为样本轴 → 逐样本空间 ACC 再平均（WB2/ECMWF 口径）；把样本轴放进 `axis` 则为池化 ACC；`centered=True` 为中心化 ACC |
+| 分类 | 计数为精确 int64，分数为 float64；推荐先合并列联表（累加器 / 求和）再计算分数 |
+| FSS | 边界补零；缺测点按邻域有效点数归一化；多场池化 `1 − Σnum/Σden`（`fss_components` / `FSSAccumulator`），与逐帧平均不同 |
+| 纬度权重 | `latitude_weights` 归一化为均值 1；自行加权时用 `(w*e).sum()/w.sum()`，区域子集用子集自己的权重和；`method='area'` 为单元面积权重 |
+| `weight_mode` | `"mean"`（默认）Σw·x/Σw；`"multiply"` Σw·x/N，保留纬度时得到面积贡献场；区域、掩码、含缺测时请用 `"mean"`（否则会警告） |
+| 术语 | FAR = 空报率 FP/(TP+FP)；POFD = 误报率 FP/(FP+TN)（`false_alarm_rate` 为其别名，已弃用）；`metvane.bias` 是平均误差 ME，频率偏差是 `frequency_bias` |
 
 ### 全网格（逐格点）评估与 `weight_mode`
 
-保留空间维（只沿时间/样本平均）即得逐格点统计；`axis=()`、累加器 `preserve_axes` 覆盖全部轴、
-`preserve_dims="all"` 在 NumPy / PyTorch(GPU) / xarray 下行为一致（不做归约）。
-
 ```python
-# fcst, obs: (time, lat, lon)
-w  = metvane.latitude_weights(lat)                      # cos(lat)/mean，内部 float64 计算
-wb = metvane.broadcast_weights(w, fcst.shape, lat_axis=-2)
-
-rmse_map = metvane.rmse(fcst, obs, axis=0)              # 逐格点真实 RMSE（画误差分布图用这个）
-contrib  = metvane.rmse(fcst, obs, axis=0, weights=wb, weight_mode="multiply")
-# contrib**2 的格点简单平均 == 纬度加权 MSE（WeatherBench / eval_xrv4 的 multiply_mean1 口径）
+rmse_map = metvane.rmse(fcst, obs, axis=(0,))                        # (lead, lat, lon) 逐格点 RMSE
+contrib = metvane.rmse(fcst, obs, axis=(0,), weights=w, weight_mode="multiply")
+# contrib**2 的格点简单平均 == 纬度加权 MSE（全球网格、权重均值 1、无缺测时）
+np.testing.assert_allclose((contrib ** 2).mean(axis=(1, 2)),
+                           metvane.mse(fcst, obs, axis=(0, 2, 3), weights=w), rtol=1e-4)
 ```
 
-| `weight_mode` | 归约公式 | 被保留的纬度维上 | 纬度被全部归约（全球网格、权重均值为 1） |
-|---|---|---|---|
-| `"mean"`（默认） | Σ(w·x) / Σw | 权重约掉 → 不加权 | 纬度加权平均 |
-| `"multiply"` | Σ(w·x) / N（N 为有效点数） | 保留权重 → 面积贡献场 | 与 `"mean"` 相同 |
+## 函数式 axis 与累加器对照
 
-权重用 `w / w.sum()` 时 `"multiply"` 即 `multiply_sum1` 口径。分母不为正的切片（`"mean"` 下权重和为 0，
-如区域掩码之外；`"multiply"` 下没有有效点；或全为 NaN）没有定义，返回 **NaN** 而不是 0（函数式 API 与累加器一致）。
-累加器与 xarray 层同样支持：
+| 需求 | 函数式 | 累加器 |
+|---|---|---|
+| 保留 lead（轴 1） | `axis=(0, 2, 3)` | `preserve_axes=[1]` 或 `axis=(0, 2, 3)` |
+| 全部归约 | `axis=None` | 默认 |
+| 不归约（逐点） | `axis=()` | `preserve_axes` 覆盖全部轴 |
 
-```python
-acc = metvane.ContinuousAccumulator(["rmse"], preserve_axes=[0, 1], weights=w2d, weight_mode="multiply")
-mxr.rmse(fcst_da, obs_da, reduce_dims="time", weights=w_da, weight_mode="multiply")
-```
-
-### 累加器模式（大数据集）
-
-```python
-acc = metvane.ContinuousAccumulator(
-    ["rmse", "mae", "bias"],
-    preserve_axes=[0],
-)
-for chunk_f, chunk_o in data_loader:
-    acc.update(chunk_f, chunk_o)
-
-result = acc.compute()  # {"rmse": array, "mae": array, "bias": array}
-```
+分类结果形状为 `(n_thresholds, *保留轴)`。
 
 ## 指标列表
 
-### 回归指标 (`metvane.continuous`)
+### 顶层函数
 
 | 函数 | 说明 |
 |------|------|
-| `rmse` | 均方根误差 |
-| `mse` | 均方误差 |
-| `mae` | 平均绝对误差 |
-| `bias` | 偏差 (fcst - obs) |
-| `acc` | 距平相关系数 |
-| `pearson_correlation` | 加权皮尔逊相关系数 |
-| `wind_vector_rmse` | 风矢量均方根误差 |
+| `rmse` / `mse` / `mae` / `bias` | 连续指标（`bias` = 平均误差 ME） |
+| `continuous_scores` | 一次计算多个连续指标 |
+| `acc` | 距平相关系数（`mean_over`、`centered`） |
+| `pearson_correlation` | 加权皮尔逊相关 |
+| `wind_vector_rmse` | 风矢量 RMSE |
+| `csi` / `pod` / `far` / `pofd` / `hss` / `ets` / `frequency_bias` / `f1` | 单阈值分类快捷函数 |
+| `fss` / `fss_components` / `fss_from_components` | 分数技巧评分及其可池化分量 |
+| `crps_ensemble`（`fair=`）/ `brier_score`（`threshold=`） | 概率指标（实验性） |
 
-### 分类指标 (`metvane.categorical`)
+### `ContingencyTable` 方法
 
-| 函数/方法 | 说明 |
-|-----------|------|
-| `ContingencyTable` | 列联表（支持多阈值） |
-| `csi` / `threat_score` | 临界成功指数 |
-| `pod` / `hit_rate` | 命中率 |
-| `far` | 虚假警报率 |
-| `hss` | Heidke 技巧评分 |
-| `ets` | 公正威胁评分 |
-| `bias_score` | 频率偏差 |
-| `f1` | F1 分数 |
-| `accuracy` | 总体准确率 |
+`csi`（`threat_score`）、`pod`（`hit_rate`）、`far`（`false_alarm_ratio`）、`pofd`、`hss`、`ets`（`gilbert_skill_score`）、
+`bias_score`（`frequency_bias`）、`f1`、`pc`（`proportion_correct`，旧名 `accuracy`）、`summary(metrics)`（大小写不敏感，接受别名）、
+`from_counts(tp, fp, fn, tn)`。
 
-### 空间指标 (`metvane.spatial`)
+### 累加器
 
-| 函数 | 说明 |
-|------|------|
-| `fss` | 分数技巧评分 (Fractions Skill Score) |
+`ContinuousAccumulator`（rmse/mse/mae/bias/acc/acc_mean）、`ContingencyAccumulator`、`FSSAccumulator`。
 
-### 概率指标 (`metvane.probabilistic`)
-
-| 函数 | 说明 |
-|------|------|
-| `crps_ensemble` | 连续排序概率评分 |
-| `brier_score` | Brier 评分 |
-
-
-## 运行测试
+## 运行测试与示例
 
 ```bash
-cd metvane
-pip install -e ".[dev]"
-pytest tests/ -v
-```
-
-## 运行示例
-
-```bash
-cd metvane
+cd MetVane
+PYTHONPATH=src python -m pytest tests            # CPU（CUDA 用例自动跳过）
+sbatch scripts/run_gpu_tests.sh                   # 在 GPU 节点上运行全部测试（含 CUDA 用例）
+PYTHONPATH=src python scripts/coverage.py --fail-under 90   # 行覆盖率（仅标准库）
 python examples/example_medium_range.py
 python examples/example_nowcasting.py
 python examples/example_gpu.py
 python examples/example_xarray.py
 ```
+
+变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## License
 
