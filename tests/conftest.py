@@ -44,6 +44,8 @@ def _try_import_torch():
 
 torch_available = _try_import_torch() is not None
 requires_torch = pytest.mark.skipif(not torch_available, reason="torch not installed")
+cuda_available = torch_available and _try_import_torch().cuda.is_available()
+requires_cuda = pytest.mark.skipif(not cuda_available, reason="CUDA not available")
 
 
 def _try_import_xarray():

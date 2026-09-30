@@ -1,95 +1,62 @@
-"""Example: xarray convenience API.
+"""Example: xarray layer (named dims, coordinate alignment, dask).
 
-Shows dimension-aware evaluation using named dimensions
-(reduce_dims / preserve_dims) with xr.DataArray and xr.Dataset.
+Observations use the opposite latitude order to the forecast — the xarray layer aligns them by
+coordinate.  Latitude weights are a DataArray on the latitude dimension.
 """
 
 import numpy as np
 
-try:
-    import xarray as xr
-    HAS_XR = True
-except ImportError:
-    HAS_XR = False
-
 
 def main():
-    if not HAS_XR:
-        print("xarray not available. Install: pip install xarray netCDF4")
-        return
-
-    import metvane.xr_api as mxr
+    try:
+        import xarray as xr
+    except ImportError:
+        print("xarray not available — example skipped (pip install 'metvane[xarray]').")
+        return None
     import metvane
+    import metvane.xr_api as mxr
 
     rng = np.random.default_rng(42)
+    time = np.arange(6)
+    lead = np.arange(1, 11)
+    lat = np.linspace(-90, 90, 73)
+    lon = np.arange(0, 360, 5.0)
+    shape = (6, 10, 73, 72)
+    dims = ("time", "lead_time", "latitude", "longitude")
+    coords = {"time": time, "lead_time": lead, "latitude": lat, "longitude": lon}
 
-    # ---------------------------------------------------------------
-    # 1. Create labeled data
-    # ---------------------------------------------------------------
-    lead_time = np.arange(1, 11)
-    lat = np.linspace(-90, 90, 64, dtype=np.float32)
-    lon = np.linspace(0, 359, 128, dtype=np.float32)
+    clim = xr.DataArray(rng.standard_normal(shape[2:]) * 5, dims=dims[2:], coords={"latitude": lat, "longitude": lon})
+    obs = xr.DataArray(rng.standard_normal(shape), dims=dims, coords=coords, attrs={"units": "K"}) + clim
+    fcst = obs + xr.DataArray(rng.standard_normal(shape) * np.linspace(0.2, 2, 10)[None, :, None, None],
+                              dims=dims, coords=coords)
+    obs = obs.sortby("latitude", ascending=False)   # different latitude order: aligned by coordinate
 
-    fcst = xr.DataArray(
-        rng.standard_normal((10, 64, 128)).astype(np.float32),
-        dims=["lead_time", "lat", "lon"],
-        coords={"lead_time": lead_time, "lat": lat, "lon": lon},
-    )
-    obs = xr.DataArray(
-        rng.standard_normal((10, 64, 128)).astype(np.float32),
-        dims=["lead_time", "lat", "lon"],
-        coords={"lead_time": lead_time, "lat": lat, "lon": lon},
-    )
+    w = metvane.latitude_weights(fcst.latitude)     # DataArray on 'latitude'
 
-    # ---------------------------------------------------------------
-    # 2. RMSE per lead time (preserve_dims)
-    # ---------------------------------------------------------------
-    rmse_lt = mxr.rmse(fcst, obs, preserve_dims="lead_time")
-    print(f"RMSE per lead_time:  dims={rmse_lt.dims}, shape={rmse_lt.shape}")
-    print(rmse_lt.values)
+    rmse = mxr.rmse(fcst, obs, preserve_dims="lead_time", weights=w)
+    print(rmse.name, dict(rmse.attrs), np.round(rmse.values[:3], 4))
+    ref = metvane.rmse(fcst.values, obs.sortby("latitude").values, axis=(0, 2, 3), weights=w.values[:, None])
+    np.testing.assert_allclose(rmse.values, ref, rtol=1e-12)
 
-    # ---------------------------------------------------------------
-    # 3. RMSE overall (reduce all)
-    # ---------------------------------------------------------------
-    rmse_all = mxr.rmse(fcst, obs)
-    print(f"\nOverall RMSE: {float(rmse_all):.4f}")
+    acc = mxr.acc(fcst, obs, clim, reduce_dims=["latitude", "longitude"], mean_over="time", weights=w)
+    print("ACC (per-time spatial ACC averaged over time):", np.round(acc.values[:3], 4))
 
-    # ---------------------------------------------------------------
-    # 4. Weighted by latitude
-    # ---------------------------------------------------------------
-    w = metvane.latitude_weights(lat)
-    w_da = xr.DataArray(w, dims=["lat"], coords={"lat": lat})
-    rmse_weighted = mxr.rmse(fcst, obs, preserve_dims="lead_time", weights=w_da)
-    print(f"\nWeighted RMSE per lead_time:\n{rmse_weighted.values}")
+    ds_f = xr.Dataset({"t2m": fcst, "z500": fcst * 100})
+    ds_o = xr.Dataset({"t2m": obs, "z500": obs * 100})
+    print("Dataset RMSE:", list(mxr.rmse(ds_f, ds_o, preserve_dims="lead_time", weights=w).data_vars))
 
-    # ---------------------------------------------------------------
-    # 5. Dataset (multi-variable)
-    # ---------------------------------------------------------------
-    fcst_ds = xr.Dataset({
-        "t2m": fcst,
-        "z500": fcst * 1000,
-    })
-    obs_ds = xr.Dataset({
-        "t2m": obs,
-        "z500": obs * 1000,
-    })
-    rmse_ds = mxr.rmse(fcst_ds, obs_ds, preserve_dims="lead_time")
-    print(f"\nDataset RMSE vars: {list(rmse_ds.data_vars)}")
-    for var in rmse_ds.data_vars:
-        print(f"  {var}: shape={rmse_ds[var].shape}")
+    scores = mxr.categorical_scores(fcst, obs, [1.0, 5.0], preserve_dims="lead_time", metrics=["csi", "hss"])
+    print("CSI dims:", scores["csi"].dims)
 
-    # ---------------------------------------------------------------
-    # 6. ACC
-    # ---------------------------------------------------------------
-    clim = xr.DataArray(
-        np.zeros((64, 128), dtype=np.float32),
-        dims=["lat", "lon"],
-        coords={"lat": lat, "lon": lon},
-    )
-    acc_lt = mxr.acc(fcst, obs, clim, preserve_dims="lead_time")
-    print(f"\nACC per lead_time:\n{acc_lt.values}")
-
-    print("\n✓ xarray evaluation example complete.")
+    try:
+        import dask  # noqa: F401
+        lazy = mxr.rmse(fcst.chunk({"time": 2}), obs.chunk({"time": 2}), preserve_dims="lead_time", weights=w)
+        assert lazy.chunks is not None
+        np.testing.assert_allclose(lazy.compute().values, rmse.values, rtol=1e-12)
+        print("dask: lazy result == eager ✓")
+    except ImportError:
+        pass
+    return rmse
 
 
 if __name__ == "__main__":

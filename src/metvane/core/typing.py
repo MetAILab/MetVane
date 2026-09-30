@@ -2,25 +2,23 @@
 
 from __future__ import annotations
 
-from typing import Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Optional, Sequence, Union
 
 import numpy as np
 
-try:
+if TYPE_CHECKING:  # pragma: no cover - import torch/xarray only for type checkers
     import torch
+    import xarray as xr
 
-    ArrayLike = Union[np.ndarray, torch.Tensor, "xr.DataArray"]
-except ImportError:
-    ArrayLike = Union[np.ndarray, "xr.DataArray"]  # type: ignore[misc]
+    ArrayLike = Union[np.ndarray, "torch.Tensor", "xr.DataArray"]
+else:
+    ArrayLike = Any
 
 AxisType = Optional[Union[int, Sequence[int]]]
 FlexibleDims = Optional[Union[str, Sequence[str]]]
 
 
 def normalize_axis(axis: AxisType, ndim: int) -> Optional[tuple[int, ...]]:
-    """Normalize *axis* to a tuple of non-negative ints, or ``None``."""
-    if axis is None:
-        return None
-    if isinstance(axis, int):
-        axis = (axis,)
-    return tuple(a % ndim for a in axis)
+    """Normalize *axis* (see :func:`metvane.core.prepare.normalize_axis`)."""
+    from .prepare import normalize_axis as _normalize
+    return _normalize(axis, ndim)

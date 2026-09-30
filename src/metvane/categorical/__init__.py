@@ -1,25 +1,38 @@
-"""Categorical evaluation metrics.
+"""Categorical (dichotomous) evaluation metrics.
 
 Classes
 -------
 ContingencyTable
-    Build once from forecasts + observations, then query any number of
-    binary classification scores (CSI, POD, FAR, HSS, ETS, …).
+    Build once from forecasts + observations (or from counts), then query any number of
+    scores (CSI, POD, FAR, POFD, HSS, ETS, frequency bias, F1, PC).
 
 Convenience functions
 ---------------------
-csi, pod, far, hss, ets — single-threshold shortcuts.
+csi, pod, far, pofd, hss, ets, frequency_bias, f1 — single-threshold shortcuts.
+
+Conventions
+-----------
+* Counts are exact int64; scores are float64.
+* A score whose denominator is 0 (e.g. CSI with no forecast and no observed events) is
+  **NaN** (undefined), not 0 — ``nanmean`` over leads/cases then skips it.  Prefer pooling
+  the counts (sum the tables, then compute the score) over averaging per-case scores.
+* ``NaN`` / masked elements / ``mask == False`` points are excluded from all counts.
+* ``op='>='`` includes the threshold; for precipitation use e.g. ``op='>='`` with 0.1 mm
+  or ``op='>'`` with 0.
+* Terminology: FAR = false alarm **ratio** FP/(TP+FP) (空报率);
+  POFD = probability of false detection FP/(FP+TN) (误报率, a.k.a. false alarm *rate*).
 """
 
 from __future__ import annotations
 
+import warnings
 from typing import Any, Optional, Sequence
 
-from ..core.backend import Backend, convert, detect_backend
+import numpy as np
+
+from ..core.array_ns import get_namespace
+from ..core.prepare import get_op, normalize_metrics, normalize_thresholds, resolve_backend, safe_divide
 from . import _impl
-
-
-_EPS = 1e-8
 
 
 class ContingencyTable:
@@ -27,191 +40,209 @@ class ContingencyTable:
 
     Parameters
     ----------
-    fcst, obs : array-like
-        Forecast and observation arrays.
-    thresholds : sequence of float
-        Event thresholds (e.g. ``[20, 35, 40]`` for dBZ).
-    op : str
-        Comparison operator (``'>='``, ``'>'``, ``'<='``, ``'<'``).
-    axis : int or tuple of ints, optional
-        Axes to reduce (aggregate).  Un-mentioned axes are preserved.
+    fcst, obs : numpy array or torch tensor of identical shape
+    thresholds : float or sequence of float
+        Event thresholds (e.g. ``[20, 35, 40]`` dBZ).
+    op : {'>=', '>', '<=', '<', '=='}
+        Event definition ``op(value, threshold)``.
+    axis : int or tuple of int, optional
+        Axes to reduce (``None`` = all, ``()`` = none).  Scores have shape
+        ``(n_thresholds, *kept_dims)``.
+    skipna : bool, default True
+        Exclude NaN points from all counts; ``False`` makes NaN-containing slices NaN.
+    mask : bool array, optional
+        Evaluation mask (True = include), broadcastable to *fcst*.
     backend, device : optional
-        Force a specific compute backend / device.
+        Force a backend (``'numpy'`` / ``'torch'``) and torch device.
 
     Examples
     --------
-    >>> table = ContingencyTable(fcst, obs, thresholds=[20, 35, 40],
-    ...                         axis=(0, 2, 3))
-    >>> table.csi()    # shape: (3_thresholds, n_leadtimes)
-    >>> table.pod()
-    >>> table.summary()
+    >>> table = ContingencyTable(fcst, obs, thresholds=[20, 35, 40], axis=(0, 2, 3))
+    >>> table.csi()          # shape (3, n_lead)
+    >>> table.summary(["csi", "pod", "far"])
     """
 
     def __init__(
         self,
         fcst: Any,
         obs: Any,
-        thresholds: Sequence[float],
+        thresholds: Any,
         *,
         op: str = ">=",
         axis: Any = None,
+        skipna: bool = True,
+        mask: Optional[Any] = None,
         backend: Optional[str] = None,
         device: Any = None,
     ):
-        if backend is not None:
-            target = Backend(backend)
-            fcst = convert(fcst, target, device=device)
-            obs = convert(obs, target, device=device)
-
-        self.thresholds = list(thresholds)
+        get_op(op)
+        fcst, obs, mask = resolve_backend((fcst, obs, mask), backend, device)
+        self.thresholds = normalize_thresholds(thresholds)
+        self.op = op
         self.tp, self.fp, self.fn, self.tn = _impl.compute_contingency(
-            fcst, obs, thresholds, op=op, axis=axis,
+            fcst, obs, self.thresholds, op=op, axis=axis, skipna=skipna, mask=mask,
         )
 
-    # --- core scores -------------------------------------------------------
+    @classmethod
+    def from_counts(cls, tp: Any, fp: Any, fn: Any, tn: Any, *,
+                    thresholds: Optional[Sequence[float]] = None, op: str = ">=") -> "ContingencyTable":
+        """Build a table from (pooled) counts, e.g. summed over files or processes."""
+        get_op(op)
+        obj = cls.__new__(cls)
+        xp = get_namespace(tp, fp, fn, tn)
+        if xp.name == "numpy":
+            tp, fp, fn, tn = (np.asarray(c) for c in (tp, fp, fn, tn))
+        shapes = {tuple(c.shape) for c in (tp, fp, fn, tn)}
+        if len(shapes) != 1:
+            raise ValueError(f"tp/fp/fn/tn 形状不一致: {sorted(shapes)}")
+        obj.tp, obj.fp, obj.fn, obj.tn = tp, fp, fn, tn
+        obj.thresholds = None if thresholds is None else normalize_thresholds(thresholds)
+        obj.op = op
+        return obj
+
+    # --- helpers -------------------------------------------------------------
+
+    def _f64(self):
+        xp = get_namespace(self.tp)
+        return xp, tuple(xp.astype(c, xp.float64) for c in (self.tp, self.fp, self.fn, self.tn))
+
+    @property
+    def n(self) -> Any:
+        """Number of valid points per table (TP+FP+FN+TN)."""
+        return self.tp + self.fp + self.fn + self.tn
+
+    # --- core scores ---------------------------------------------------------
 
     def csi(self) -> Any:
-        """Critical Success Index (Threat Score).
-
-        CSI = TP / (TP + FP + FN)
-        """
-        return self.tp / (self.tp + self.fp + self.fn + _EPS)
+        """Critical Success Index (Threat Score): TP / (TP + FP + FN)."""
+        xp, (tp, fp, fn, _) = self._f64()
+        return safe_divide(xp, tp, tp + fp + fn)
 
     threat_score = csi
 
     def pod(self) -> Any:
-        """Probability of Detection (Hit Rate / Recall).
+        """Probability of Detection (hit rate): TP / (TP + FN)."""
+        xp, (tp, _, fn, _) = self._f64()
+        return safe_divide(xp, tp, tp + fn)
 
-        POD = TP / (TP + FN)
-        """
-        return self.tp / (self.tp + self.fn + _EPS)
-
-    hit_rate = recall = pod
+    hit_rate = pod
 
     def far(self) -> Any:
-        """False Alarm Ratio.
-
-        FAR = FP / (TP + FP)
-        """
-        return self.fp / (self.tp + self.fp + _EPS)
+        """False Alarm **Ratio** (空报率): FP / (TP + FP)."""
+        xp, (tp, fp, _, _) = self._f64()
+        return safe_divide(xp, fp, tp + fp)
 
     false_alarm_ratio = far
 
     def pofd(self) -> Any:
-        """Probability of False Detection (False Alarm Rate).
+        """Probability of False Detection (误报率, "false alarm rate"): FP / (FP + TN)."""
+        xp, (_, fp, _, tn) = self._f64()
+        return safe_divide(xp, fp, fp + tn)
 
-        POFD = FP / (FP + TN)
-        """
-        return self.fp / (self.fp + self.tn + _EPS)
-
-    false_alarm_rate = pofd
+    def false_alarm_rate(self) -> Any:
+        """Deprecated alias of :meth:`pofd` (easily confused with FAR = false alarm ratio)."""
+        warnings.warn("false_alarm_rate() 是 POFD = FP/(FP+TN)（误报率），不是 FAR = FP/(TP+FP)（空报率）；"
+                      "请改用 pofd()，该别名将在后续版本移除", FutureWarning, stacklevel=2)
+        return self.pofd()
 
     def hss(self) -> Any:
-        """Heidke Skill Score.
-
-        HSS = 2(TP*TN - FP*FN) / ((TP+FN)(FN+TN) + (TP+FP)(FP+TN))
-        """
-        num = 2 * (self.tp * self.tn - self.fp * self.fn)
-        den = (
-            (self.tp + self.fn) * (self.fn + self.tn)
-            + (self.tp + self.fp) * (self.fp + self.tn)
-        )
-        return num / (den + _EPS)
+        """Heidke Skill Score: 2(TP·TN − FP·FN) / ((TP+FN)(FN+TN) + (TP+FP)(FP+TN))."""
+        xp, (tp, fp, fn, tn) = self._f64()
+        num = 2 * (tp * tn - fp * fn)
+        den = (tp + fn) * (fn + tn) + (tp + fp) * (fp + tn)
+        return safe_divide(xp, num, den)
 
     heidke_skill_score = hss
 
     def ets(self) -> Any:
         """Equitable Threat Score (Gilbert Skill Score).
 
-        ETS = (TP - hits_random) / (TP + FP + FN - hits_random)
-        where hits_random = (TP+FP)(TP+FN) / N
+        ETS = (TP − R) / (TP + FP + FN − R), R = (TP+FP)(TP+FN)/N, evaluated in the equivalent
+        integer form  D / (D + N·(FP+FN)),  D = TP·TN − FP·FN.
         """
-        n = self.tp + self.fp + self.fn + self.tn
-        hits_random = (self.tp + self.fp) * (self.tp + self.fn) / (n + _EPS)
-        return (self.tp - hits_random) / (
-            self.tp + self.fp + self.fn - hits_random + _EPS
-        )
+        xp, (tp, fp, fn, tn) = self._f64()
+        d = tp * tn - fp * fn
+        n = tp + fp + fn + tn
+        return safe_divide(xp, d, d + n * (fp + fn))
 
     equitable_threat_score = gilbert_skill_score = ets
 
     def bias_score(self) -> Any:
-        """Frequency Bias.
-
-        BIAS = (TP + FP) / (TP + FN)
-        """
-        return (self.tp + self.fp) / (self.tp + self.fn + _EPS)
+        """Frequency bias: (TP + FP) / (TP + FN).  (Not the continuous mean error ``metvane.bias``.)"""
+        xp, (tp, fp, fn, _) = self._f64()
+        return safe_divide(xp, tp + fp, tp + fn)
 
     frequency_bias = bias_score
 
     def f1(self) -> Any:
-        """F1 Score.
+        """F1 score: 2TP / (2TP + FP + FN)."""
+        xp, (tp, fp, fn, _) = self._f64()
+        return safe_divide(xp, 2 * tp, 2 * tp + fp + fn)
 
-        F1 = 2TP / (2TP + FP + FN)
-        """
-        return 2 * self.tp / (2 * self.tp + self.fp + self.fn + _EPS)
+    def pc(self) -> Any:
+        """Proportion Correct: (TP + TN) / N."""
+        xp, (tp, fp, fn, tn) = self._f64()
+        return safe_divide(xp, tp + tn, tp + fp + fn + tn)
 
-    def accuracy(self) -> Any:
-        """Overall accuracy.
+    proportion_correct = accuracy = pc
 
-        ACC = (TP + TN) / N
-        """
-        n = self.tp + self.fp + self.fn + self.tn
-        return (self.tp + self.tn) / (n + _EPS)
+    _SCORES = {
+        "csi": "csi", "ts": "csi", "threat_score": "csi",
+        "pod": "pod", "hit_rate": "pod",
+        "far": "far", "false_alarm_ratio": "far",
+        "pofd": "pofd",
+        "hss": "hss", "heidke_skill_score": "hss",
+        "ets": "ets", "gss": "ets", "equitable_threat_score": "ets", "gilbert_skill_score": "ets",
+        "bias_score": "bias_score", "frequency_bias": "bias_score", "fbias": "bias_score",
+        "f1": "f1",
+        "pc": "pc", "accuracy": "pc", "proportion_correct": "pc",
+    }
+    _DEFAULT = ("csi", "pod", "far", "pofd", "hss", "ets", "bias_score", "f1", "pc")
 
-    def summary(self, metrics: Optional[Sequence[str]] = None) -> dict[str, Any]:
-        """Return a dict of all (or selected) scores."""
-        _all = {
-            "csi": self.csi,
-            "pod": self.pod,
-            "far": self.far,
-            "pofd": self.pofd,
-            "hss": self.hss,
-            "ets": self.ets,
-            "bias_score": self.bias_score,
-            "f1": self.f1,
-            "accuracy": self.accuracy,
-        }
-        keys = metrics or list(_all.keys())
-        return {k: _all[k]() for k in keys}
+    def summary(self, metrics: Optional[Any] = None) -> dict[str, Any]:
+        """Dict of scores.  ``metrics=None`` → all canonical scores; names are case-insensitive
+        and accept aliases (e.g. ``'TS'``, ``'frequency_bias'``); keys are returned as given."""
+        if metrics is None:
+            return {k: getattr(self, k)() for k in self._DEFAULT}
+        names = (metrics,) if isinstance(metrics, str) else tuple(metrics)
+        normalize_metrics(tuple(m.lower() for m in names), set(self._SCORES), what="ContingencyTable 指标")
+        return {m: getattr(self, self._SCORES[m.lower()])() for m in names}
+
+    def __repr__(self) -> str:
+        return (f"ContingencyTable(thresholds={self.thresholds}, op='{self.op}', "
+                f"shape={tuple(self.tp.shape)})")
 
 
 # --- convenience functions -------------------------------------------------
 
-def csi(fcst: Any, obs: Any, threshold: float, *, op: str = ">=",
-        axis: Any = None, backend: Any = None, device: Any = None) -> Any:
-    """Single-threshold CSI (shortcut)."""
-    t = ContingencyTable(fcst, obs, [threshold], op=op, axis=axis,
-                         backend=backend, device=device)
-    return t.csi()[0]
+def _scalar_threshold(threshold: Any) -> float:
+    if isinstance(threshold, (bool, np.bool_)) or not isinstance(threshold, (int, float, np.integer, np.floating)):
+        if getattr(threshold, "ndim", None) == 0:
+            return float(threshold)
+        raise TypeError(f"快捷函数只接受单个阈值，得到 {threshold!r}；多阈值请用 ContingencyTable")
+    return float(threshold)
 
 
-def pod(fcst: Any, obs: Any, threshold: float, *, op: str = ">=",
-        axis: Any = None, backend: Any = None, device: Any = None) -> Any:
-    """Single-threshold POD (shortcut)."""
-    t = ContingencyTable(fcst, obs, [threshold], op=op, axis=axis,
-                         backend=backend, device=device)
-    return t.pod()[0]
+def _shortcut(name):
+    def fn(fcst: Any, obs: Any, threshold: float, *, op: str = ">=", axis: Any = None,
+           skipna: bool = True, mask: Optional[Any] = None, backend: Any = None, device: Any = None) -> Any:
+        t = ContingencyTable(fcst, obs, [_scalar_threshold(threshold)], op=op, axis=axis,
+                             skipna=skipna, mask=mask, backend=backend, device=device)
+        return getattr(t, name)()[0]
+    fn.__name__ = fn.__qualname__ = name if name != "bias_score" else "frequency_bias"
+    fn.__doc__ = (f"Single-threshold :meth:`ContingencyTable.{name}` shortcut.\n\n"
+                  f"Parameters as in :class:`ContingencyTable`; *threshold* must be a scalar.  "
+                  f"Returns shape ``kept_dims`` (float64, NaN where undefined).")
+    return fn
 
 
-def far(fcst: Any, obs: Any, threshold: float, *, op: str = ">=",
-        axis: Any = None, backend: Any = None, device: Any = None) -> Any:
-    """Single-threshold FAR (shortcut)."""
-    t = ContingencyTable(fcst, obs, [threshold], op=op, axis=axis,
-                         backend=backend, device=device)
-    return t.far()[0]
+csi = _shortcut("csi")
+pod = _shortcut("pod")
+far = _shortcut("far")
+pofd = _shortcut("pofd")
+hss = _shortcut("hss")
+ets = _shortcut("ets")
+frequency_bias = _shortcut("bias_score")
+f1 = _shortcut("f1")
 
-
-def hss(fcst: Any, obs: Any, threshold: float, *, op: str = ">=",
-        axis: Any = None, backend: Any = None, device: Any = None) -> Any:
-    """Single-threshold HSS (shortcut)."""
-    t = ContingencyTable(fcst, obs, [threshold], op=op, axis=axis,
-                         backend=backend, device=device)
-    return t.hss()[0]
-
-
-def ets(fcst: Any, obs: Any, threshold: float, *, op: str = ">=",
-        axis: Any = None, backend: Any = None, device: Any = None) -> Any:
-    """Single-threshold ETS (shortcut)."""
-    t = ContingencyTable(fcst, obs, [threshold], op=op, axis=axis,
-                         backend=backend, device=device)
-    return t.ets()[0]
+__all__ = ["ContingencyTable", "csi", "pod", "far", "pofd", "hss", "ets", "frequency_bias", "f1"]

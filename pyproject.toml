@@ -1,13 +1,14 @@
 [build-system]
-requires = ["setuptools>=64", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "metvane"
-version = "0.1.0"
+dynamic = ["version"]
 description = "A unified evaluation framework for weather forecasting and nowcasting"
 readme = "README.md"
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.9"
 authors = [
     {name = "MetVane Contributors"},
@@ -16,7 +17,6 @@ keywords = ["weather", "forecasting", "nowcasting", "evaluation", "metrics", "ve
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
     "Topic :: Scientific/Engineering :: Atmospheric Science",
 ]
@@ -26,16 +26,26 @@ dependencies = [
 
 [project.optional-dependencies]
 torch = ["torch>=1.12"]
-xarray = ["xarray>=2022.3", "netCDF4"]
-all = ["torch>=1.12", "xarray>=2022.3", "netCDF4", "scipy"]
-dev = ["pytest>=7.0", "torch>=1.12", "xarray>=2022.3", "scipy"]
+xarray = ["xarray>=2022.3", "pandas"]
+examples = ["xarray>=2022.3", "netCDF4"]
+all = ["torch>=1.12", "xarray>=2022.3", "pandas"]
+dev = ["pytest>=7.0", "torch>=1.12", "xarray>=2022.3", "pandas", "dask", "scipy"]
 
 [project.urls]
 Homepage = "https://github.com/MetAILab/metvane"
 Repository = "https://github.com/MetAILab/metvane"
 
+[tool.setuptools.dynamic]
+version = {attr = "metvane.__version__"}
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+metvane = ["py.typed"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "gpu: requires a CUDA device (run on a GPU node, see scripts/run_gpu_tests.sh)",
+]

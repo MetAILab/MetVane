@@ -18,3 +18,4 @@ htmlcov/
 *.npy
 *.nc
 .DS_Store
+metvane_gpu_tests_*.log

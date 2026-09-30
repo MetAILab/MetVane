@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 import metvane
-from .conftest import requires_torch
+from .conftest import requires_cuda, requires_torch
 
 
 class TestContinuousNumpy:
@@ -116,10 +116,7 @@ class TestContinuousTorch:
         result = metvane.rmse(fcst, obs, backend="torch")
         assert isinstance(result, torch.Tensor)
 
-    @pytest.mark.skipif(
-        not __import__("torch").cuda.is_available(),
-        reason="CUDA not available",
-    )
+    @requires_cuda
     def test_gpu_rmse(self):
         import torch
         fcst = torch.randn(100, device="cuda")
